@@ -1,0 +1,46 @@
+diff --git a/pdf.js b/pdf.js
+index 27e060c..1e837ef 100644
+--- a/pdf.js
++++ b/pdf.js
+@@ -643,15 +643,32 @@ const render = async (page, doc, zoom, pageColors) => {
+     // the canvas must be in the `PDFDocument`'s `ownerDocument`
+     // (`globalThis.document` by default); that's where the fonts are loaded
+     const canvas = document.createElement('canvas')
+-    canvas.height = renderViewport.height
+-    canvas.width = renderViewport.width
+-    // The CSS box is the un-truncated display size, so the (integer-truncated)
+-    // over-sampled bitmap is scaled by the browser to fill the page box exactly.
+-    // Pinning the box to the display viewport (rather than letting the truncated
+-    // bitmap drive layout) also keeps the left page flush to the spine of a
+-    // two-page spread instead of exposing a one-pixel white seam (#4587).
+-    canvas.style.width = `${displayViewport.width}px`
+-    canvas.style.height = `${displayViewport.height}px`
++    if (renderDpr === devicePixelRatio) {
++        // The bitmap is at the screen's own resolution, so make it map onto the
++        // screen 1:1. A bitmap that is not a whole number of device pixels across
++        // its box gets resampled by the browser, which softens glyph edges (what
++        // pdf.js's own viewer avoids by sizing its canvas the same way). Round the
++        // bitmap UP to whole device pixels and size the CSS box to exactly that
++        // many. Up, not down: the box stays at least as big as the page box, so
++        // the left page of a two-page spread still reaches the spine (#4587) and
++        // the sub-pixel excess is clipped by the page's iframe. The epsilon stops
++        // floating-point noise (783.0000001) from adding a whole extra pixel.
++        canvas.width = Math.ceil(renderViewport.width - 1e-3)
++        canvas.height = Math.ceil(renderViewport.height - 1e-3)
++        canvas.style.width = `${canvas.width / renderDpr}px`
++        canvas.style.height = `${canvas.height / renderDpr}px`
++    } else {
++        // The bitmap is deliberately coarser than the screen (memory budget, or a
++        // zoomed-out window), so it is stretched anyway. The CSS box is the
++        // un-truncated display size, so the (integer-truncated) bitmap is scaled
++        // by the browser to fill the page box exactly. Pinning the box to the
++        // display viewport also keeps the left page flush to the spine of a
++        // two-page spread instead of exposing a one-pixel white seam (#4587).
++        canvas.height = renderViewport.height
++        canvas.width = renderViewport.width
++        canvas.style.width = `${displayViewport.width}px`
++        canvas.style.height = `${displayViewport.height}px`
++    }
+     const canvasContext = canvas.getContext('2d')
+     const renderTask = page.render({ canvasContext, viewport: renderViewport })
+     activeRenderTasks.set(doc, renderTask)
