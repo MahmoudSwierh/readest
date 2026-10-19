@@ -1,7 +1,28 @@
 diff --git a/pdf.js b/pdf.js
-index 27e060c..1e837ef 100644
+index 27e060c..4be6948 100644
 --- a/pdf.js
 +++ b/pdf.js
+@@ -396,17 +396,17 @@ export const setupPanningEvents = (doc) => {
+ // device pixel ratio. Phones report dpr 3, which is the tipping factor.
+ // Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
+ // per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
+-const MAX_RENDER_DPR = 2
++const MAX_RENDER_DPR = 4
+ // Hard ceiling on a single page's bitmap area (~3.1 Mpx ≈ 12.6 MB) so a large
+ // tablet page can't blow the budget even after the dpr clamp.
+-const MAX_CANVAS_PIXELS = 2048 * 1536
++const MAX_CANVAS_PIXELS = 4096 * 3072
+ // Ceiling on a decoded image (4 bytes per pixel), a few times the page budget so
+ // zooming still has detail. Scanned scores carry 1-bit ~9000x12000 px pages that
+ // pdf.js would otherwise decode to ~430 MB bitmaps; iOS holds those in the WebKit
+ // GPU process, which jetsam kills past ~300 MB until WebKit gives up on the page
+ // and the reader reloads (readest #6521). pdf.js downscales anything larger, and
+ // Readest's worker hook does so without the full-size intermediate bitmap.
+-const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
++const MAX_IMAGE_BYTES = 4 * (2048 * 1536) * 4
+ 
+ // Only mobile WebViews get that budget. Desktop browsers have no per-process
+ // memory ceiling, and a page fitted to a desktop window is several times the
 @@ -643,15 +643,32 @@ const render = async (page, doc, zoom, pageColors) => {
      // the canvas must be in the `PDFDocument`'s `ownerDocument`
      // (`globalThis.document` by default); that's where the fonts are loaded
