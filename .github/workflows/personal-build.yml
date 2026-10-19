@@ -1,0 +1,127 @@
+# Personal build: Windows installer (.exe) + Android APK, no secrets needed.
+# Put this file at .github/workflows/personal-build.yml in YOUR fork, then run it from
+# the Actions tab ("Personal build" -> "Run workflow"). Results appear under "Artifacts".
+name: Personal build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # No updater signing key in a personal fork, so don't ask for one.
+  NO_UPDATER: '{"bundle":{"createUpdaterArtifacts":false}}'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - run: git submodule update --init --recursive
+      - name: apply crisp-PDF fix
+        shell: bash
+        run: git -C packages/foliate-js apply "$GITHUB_WORKSPACE/personal/foliate-js-crisp-pdf.patch"
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @readest/readest-app setup-vendors
+      - name: env file
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> apps/readest-app/.env.local
+      - name: build installer
+        shell: bash
+        working-directory: apps/readest-app
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config "$NO_UPDATER"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Readest-windows-exe
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+      - run: git submodule update --init --recursive
+      - name: apply crisp-PDF fix
+        shell: bash
+        run: git -C packages/foliate-js apply "$GITHUB_WORKSPACE/personal/foliate-js-crisp-pdf.patch"
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+      - run: sdkmanager "ndk;28.2.13676358"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @readest/readest-app setup-vendors
+      - name: env file
+        run: echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> apps/readest-app/.env.local
+      # Keep ONE signing key between runs so a new APK installs over the old one
+      # (keeps your books). It is cached, and also uploaded as an artifact: download
+      # and keep "android-signing-key" somewhere safe.
+      - name: restore signing key
+        id: key
+        uses: actions/cache@v4
+        with:
+          path: signing/keystore.jks
+          key: android-signing-key-v1
+      - name: create signing key (first run only)
+        if: steps.key.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p signing
+          keytool -genkeypair -v -keystore signing/keystore.jks -storetype JKS \
+            -alias personal -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass personalreadest -keypass personalreadest \
+            -dname "CN=Personal Readest"
+      - name: build apk (64-bit ARM phones)
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+          cd src-tauri/gen/android
+          {
+            echo "keyAlias=personal"
+            echo "password=personalreadest"
+            echo "storeFile=$GITHUB_WORKSPACE/signing/keystore.jks"
+          } > keystore.properties
+          cd ../../..
+          pnpm tauri android build -t aarch64 --apk --config "$NO_UPDATER"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk ../../Readest-personal.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Readest-android-apk
+          path: Readest-personal.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-signing-key
+          path: signing/keystore.jks
