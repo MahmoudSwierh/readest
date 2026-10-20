@@ -1,5 +1,92 @@
+diff --git a/fixed-layout.js b/fixed-layout.js
+index e791285..a3f1428 100644
+--- a/fixed-layout.js
++++ b/fixed-layout.js
+@@ -357,6 +357,10 @@ export class FixedLayout extends HTMLElement {
+     // placeholder layout (and thus scrollTop) can't drift mid-pinch, which would
+     // make the live preview and the committed zoom land in different places.
+     #pinching = false
++    // Pinch preview is applied once per animation frame (not once per touch
++    // event) and on its own compositor layer, so the GPU just scales a texture.
++    #pinchRatio = 1
++    #pinchRaf = 0
+     // On-screen rect of the page under the viewport centre, captured from the
+     // live (still-transformed) preview at pinch end ({ index, top, left }). The
+     // commit re-render scrolls that page back to this exact rect, so the zoom
+@@ -2007,14 +2011,28 @@ export class FixedLayout extends HTMLElement {
+             })
+     }
+     pinchZoom(ratio) {
++        this.#pinchRatio = ratio
++        // Suppress paging immediately so the layout can't drift mid-pinch.
++        if (this.#scrollMode && this.#scrollContainer) this.#pinching = true
++        if (this.#pinchRaf) return
++        this.#pinchRaf = requestAnimationFrame(() => {
++            this.#pinchRaf = 0
++            this.#applyPinch()
++        })
++    }
++    // Apply a still-pending preview frame now (pinchEnd reads the previewed rect).
++    #flushPinch() {
++        if (!this.#pinchRaf) return
++        cancelAnimationFrame(this.#pinchRaf)
++        this.#pinchRaf = 0
++        this.#applyPinch()
++    }
++    #applyPinch() {
++        const ratio = this.#pinchRatio
+         // Scroll mode: scale the whole scroll container so the zoom tracks the
+-        // fingers live, anchored at the viewport centre. Suppress paging and
+-        // snapshot the centre anchor on the first move so the layout stays still
+-        // and the commit lands exactly where the preview shows.
++        // fingers live, anchored at the viewport centre.
+         if (this.#scrollMode) {
+             if (this.#scrollContainer) {
+-                // Suppress paging so the layout can't drift mid-pinch.
+-                this.#pinching = true
+                 const { transform, transformOrigin } = computeScrollPinchTransform({
+                     ratio,
+                     scrollLeft: this.#scrollHorizontal && this.rtl
+@@ -2024,6 +2042,7 @@ export class FixedLayout extends HTMLElement {
+                     viewportWidth: this.clientWidth,
+                     viewportHeight: this.clientHeight,
+                 })
++                this.#scrollContainer.style.willChange = 'transform'
+                 this.#scrollContainer.style.transformOrigin = transformOrigin
+                 this.#scrollContainer.style.transform = transform
+             }
+@@ -2034,11 +2053,13 @@ export class FixedLayout extends HTMLElement {
+             : [this.#left, this.#right]
+         for (const frame of frames) {
+             if (!frame?.element || frame.element.style.visibility === 'hidden') continue
++            frame.element.style.willChange = 'transform'
+             frame.element.style.transform = `scale(${ratio})`
+             frame.element.style.transformOrigin = 'center'
+         }
+     }
+     pinchEnd() {
++        this.#flushPinch()
+         if (this.#scrollMode) {
+             // Snapshot the centre page's on-screen rect from the still-scaled
+             // preview, then drop the transform and resume paging. The committed
+@@ -2048,6 +2069,7 @@ export class FixedLayout extends HTMLElement {
+             if (this.#scrollContainer) {
+                 this.#pinchAnchor = this.#captureCenterPageRect()
+                 this.#scrollContainer.style.removeProperty('transform')
++                this.#scrollContainer.style.removeProperty('will-change')
+                 this.#scrollContainer.style.removeProperty('transform-origin')
+             }
+             return
+@@ -2063,6 +2085,7 @@ export class FixedLayout extends HTMLElement {
+         for (const frame of [this.#center, this.#left, this.#right]) {
+             if (!frame?.element) continue
+             frame.element.style.removeProperty('transform')
++            frame.element.style.removeProperty('will-change')
+             frame.element.style.removeProperty('transform-origin')
+         }
+     }
 diff --git a/pdf.js b/pdf.js
-index 27e060c..4be6948 100644
+index 27e060c..948b2fd 100644
 --- a/pdf.js
 +++ b/pdf.js
 @@ -396,17 +396,17 @@ export const setupPanningEvents = (doc) => {
@@ -23,7 +110,21 @@ index 27e060c..4be6948 100644
  
  // Only mobile WebViews get that budget. Desktop browsers have no per-process
  // memory ceiling, and a page fitted to a desktop window is several times the
-@@ -643,15 +643,32 @@ const render = async (page, doc, zoom, pageColors) => {
+@@ -640,18 +640,46 @@ const render = async (page, doc, zoom, pageColors) => {
+     const renderViewport = page.getViewport({ scale: renderScale })
+     const displayViewport = page.getViewport({ scale: zoom })
+ 
++    // The sharp bitmap takes a while to draw (much longer on a phone), and the
++    // old canvas keeps its old CSS size until it is swapped, so the page used to
++    // shrink back / sit small while the text layer (which scales instantly)
++    // moved on without it. Stretch the previous bitmap to the new size right
++    // away: a blurry-but-correct page now, the crisp one as soon as it's ready.
++    const staleCanvas = doc.querySelector('#canvas canvas')
++    if (staleCanvas) {
++        staleCanvas.style.width = `${displayViewport.width}px`
++        staleCanvas.style.height = `${displayViewport.height}px`
++    }
++
      // the canvas must be in the `PDFDocument`'s `ownerDocument`
      // (`globalThis.document` by default); that's where the fonts are loaded
      const canvas = document.createElement('canvas')
