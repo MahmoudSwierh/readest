@@ -1,8 +1,8 @@
 diff --git a/fixed-layout.js b/fixed-layout.js
-index e791285..a3f1428 100644
+index e791285..32950ab 100644
 --- a/fixed-layout.js
 +++ b/fixed-layout.js
-@@ -357,6 +357,10 @@ export class FixedLayout extends HTMLElement {
+@@ -357,6 +357,17 @@ export class FixedLayout extends HTMLElement {
      // placeholder layout (and thus scrollTop) can't drift mid-pinch, which would
      // make the live preview and the committed zoom land in different places.
      #pinching = false
@@ -10,14 +10,114 @@ index e791285..a3f1428 100644
 +    // event) and on its own compositor layer, so the GPU just scales a texture.
 +    #pinchRatio = 1
 +    #pinchRaf = 0
++    // Where the fingers are (host viewport coordinates), tracked from the touch
++    // events themselves, and the geometry captured when a pinch starts. The
++    // preview scales about the fingers and is clamped exactly the way the
++    // committed layout will be, so letting go doesn't move the page.
++    #touchTrack = null
++    #touchMid = null
++    #pinchGeom = null
      // On-screen rect of the page under the viewport centre, captured from the
      // live (still-transformed) preview at pinch end ({ index, top, left }). The
      // commit re-render scrolls that page back to this exact rect, so the zoom
-@@ -2007,14 +2011,28 @@ export class FixedLayout extends HTMLElement {
+@@ -532,6 +543,9 @@ export class FixedLayout extends HTMLElement {
+         }`)
+ 
+         this.#observer.observe(this)
++        const opts = { passive: true, capture: true }
++        this.addEventListener('touchstart', e => this.#onTouch(e, true), opts)
++        this.addEventListener('touchmove', e => this.#onTouch(e, false), opts)
+     }
+     attributeChangedCallback(name, _, value) {
+         switch (name) {
+@@ -654,6 +668,35 @@ export class FixedLayout extends HTMLElement {
+         this.#lockedPanX = null
+         this.style.removeProperty('--locked-pan-x')
+     }
++    // Midpoint of a two-finger touch in host viewport coordinates. Inside a page
++    // iframe, client coordinates are the iframe's own, so they are offset by the
++    // iframe's on-screen rect at the start of the gesture; after that only the
++    // screen-coordinate movement is used (client coordinates oscillate while the
++    // preview transform is applied).
++    #onTouch(e, start, iframe, doc) {
++        if (e.touches.length < 2) return
++        const [a, b] = [e.touches[0], e.touches[1]]
++        const sx = (a.screenX + b.screenX) / 2
++        const sy = (a.screenY + b.screenY) / 2
++        if (start || !this.#touchTrack) {
++            let wx = (a.clientX + b.clientX) / 2
++            let wy = (a.clientY + b.clientY) / 2
++            if (iframe) {
++                const r = iframe.getBoundingClientRect()
++                const { clientWidth, clientHeight } = doc.documentElement
++                wx = r.left + wx * (clientWidth ? r.width / clientWidth : 1)
++                wy = r.top + wy * (clientHeight ? r.height / clientHeight : 1)
++            }
++            this.#touchTrack = { wx, wy, sx, sy }
++        }
++        const t = this.#touchTrack
++        this.#touchMid = { x: t.wx + sx - t.sx, y: t.wy + sy - t.sy }
++    }
++    #trackTouches(doc, iframe) {
++        const opts = { passive: true, capture: true }
++        doc.addEventListener('touchstart', e => this.#onTouch(e, true, iframe, doc), opts)
++        doc.addEventListener('touchmove', e => this.#onTouch(e, false, iframe, doc), opts)
++    }
+     async #createFrame({ index, src: srcOption, detached = false }) {
+         const srcOptionIsString = typeof srcOption === 'string'
+         const src = srcOptionIsString ? srcOption : srcOption?.src
+@@ -689,6 +732,7 @@ export class FixedLayout extends HTMLElement {
+             iframe.addEventListener('load', async () => {
+                 const doc = iframe.contentDocument
+                 this.#applyPanLock(doc)
++                this.#trackTouches(doc, iframe)
+                 iframe.dataset.sectionIndex = index
+                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+                 const { width, height } = await getViewport(doc, this.defaultViewport)
+@@ -2006,15 +2050,73 @@ export class FixedLayout extends HTMLElement {
+                 }
              })
      }
++    // Capture the layout at the start of a pinch (nothing is transformed yet).
++    #startPinch() {
++        const host = this.getBoundingClientRect()
++        const vw = this.clientWidth, vh = this.clientHeight
++        const pivot = this.#touchMid ?? { x: host.left + vw / 2, y: host.top + vh / 2 }
++        const g = { host, vw, vh, pivot, mode: 'center' }
++        if (this.#scrollMode) {
++            if (!this.#scrollHorizontal && this.#lockedPanX === null && this.#scrollContainer) {
++                g.mode = 'strip'
++                g.sx = this.scrollLeft
++                g.sy = this.scrollTop
++                g.cw = this.#scrollContainer.offsetWidth
++                g.ch = this.#scrollContainer.offsetHeight
++            }
++        } else {
++            const frames = (this.#center ? [this.#center] : [this.#left, this.#right])
++                .filter(f => f?.element && f.element.style.visibility !== 'hidden')
++            const rects = frames.map(f => f.element.getBoundingClientRect())
++            if (frames.length) {
++                g.mode = 'page'
++                g.frames = frames
++                g.rects = rects
++                g.left = Math.min(...rects.map(r => r.left))
++                g.top = Math.min(...rects.map(r => r.top))
++                g.right = Math.max(...rects.map(r => r.right))
++                g.bottom = Math.max(...rects.map(r => r.bottom))
++            }
++        }
++        this.#pinchGeom = g
++    }
++    // The zoom the app will commit for this ratio (whole percent, clamped), so
++    // the preview is exactly the size of the committed page.
++    #snapPinchRatio(ratio) {
++        const base = this.#scaleFactor * 100
++        if (!(base > 0)) return ratio
++        return clamp(Math.round(base * ratio), 50, 500) / base
++    }
      pinchZoom(ratio) {
-+        this.#pinchRatio = ratio
++        if (!this.#pinchGeom) this.#startPinch()
++        this.#pinchRatio = this.#snapPinchRatio(ratio)
 +        // Suppress paging immediately so the layout can't drift mid-pinch.
 +        if (this.#scrollMode && this.#scrollContainer) this.#pinching = true
 +        if (this.#pinchRaf) return
@@ -35,41 +135,82 @@ index e791285..a3f1428 100644
 +    }
 +    #applyPinch() {
 +        const ratio = this.#pinchRatio
++        const g = this.#pinchGeom
++        if (!g) return
++        const cur = this.#touchMid ?? g.pivot
          // Scroll mode: scale the whole scroll container so the zoom tracks the
 -        // fingers live, anchored at the viewport centre. Suppress paging and
 -        // snapshot the centre anchor on the first move so the layout stays still
 -        // and the commit lands exactly where the preview shows.
-+        // fingers live, anchored at the viewport centre.
++        // fingers live.
          if (this.#scrollMode) {
-             if (this.#scrollContainer) {
+-            if (this.#scrollContainer) {
 -                // Suppress paging so the layout can't drift mid-pinch.
 -                this.#pinching = true
++            if (!this.#scrollContainer) return
++            this.#scrollContainer.style.willChange = 'transform'
++            if (g.mode !== 'strip') {
++                // Horizontal / locked-pan strips: scale about the viewport centre.
                  const { transform, transformOrigin } = computeScrollPinchTransform({
                      ratio,
                      scrollLeft: this.#scrollHorizontal && this.rtl
-@@ -2024,6 +2042,7 @@ export class FixedLayout extends HTMLElement {
-                     viewportWidth: this.clientWidth,
-                     viewportHeight: this.clientHeight,
+@@ -2026,19 +2128,47 @@ export class FixedLayout extends HTMLElement {
                  })
-+                this.#scrollContainer.style.willChange = 'transform'
                  this.#scrollContainer.style.transformOrigin = transformOrigin
                  this.#scrollContainer.style.transform = transform
++                return
              }
-@@ -2034,11 +2053,13 @@ export class FixedLayout extends HTMLElement {
-             : [this.#left, this.#right]
-         for (const frame of frames) {
-             if (!frame?.element || frame.element.style.visibility === 'hidden') continue
-+            frame.element.style.willChange = 'transform'
-             frame.element.style.transform = `scale(${ratio})`
-             frame.element.style.transformOrigin = 'center'
++            const { host, vw, vh, sx, sy, cw, ch } = g
++            const p = { x: g.pivot.x - host.left, y: g.pivot.y - host.top }
++            const c = { x: cur.x - host.left, y: cur.y - host.top }
++            // Along the strip: keep the content under the fingers under them,
++            // within the strip (the same clamp the browser applies to scrollTop).
++            const top = clamp(ratio * (sy + p.y) - c.y, 0, Math.max(0, ch * ratio - vh))
++            // Across the strip: pages are centred while they fit, else follow the fingers.
++            const tx = cw * ratio > vw
++                ? sx - clamp(ratio * (sx + p.x) - c.x, 0, cw * ratio - vw)
++                : vw / 2 - ratio * cw / 2 + sx
++            this.#scrollContainer.style.transformOrigin = '0 0'
++            this.#scrollContainer.style.transform = `translate(${tx}px, ${sy - top}px) scale(${ratio})`
+             return
          }
+-        const frames = this.#center
+-            ? [this.#center]
+-            : [this.#left, this.#right]
+-        for (const frame of frames) {
+-            if (!frame?.element || frame.element.style.visibility === 'hidden') continue
+-            frame.element.style.transform = `scale(${ratio})`
+-            frame.element.style.transformOrigin = 'center'
+-        }
++        if (g.mode !== 'page') return
++        // Where the page (or spread) will sit once committed: centred while it
++        // fits the viewport, otherwise kept under the fingers but never scrolled
++        // past its own edges.
++        const place = (start, size, view, hostStart, pivot, now) => {
++            const next = size * ratio
++            if (next <= view) return hostStart + (view - next) / 2
++            return clamp(now + (start - pivot) * ratio, hostStart + view - next, hostStart)
++        }
++        const left = place(g.left, g.right - g.left, g.vw, g.host.left, g.pivot.x, cur.x)
++        const top = place(g.top, g.bottom - g.top, g.vh, g.host.top, g.pivot.y, cur.y)
++        g.frames.forEach((frame, i) => {
++            const r = g.rects[i]
++            const el = frame.element
++            el.style.willChange = 'transform'
++            el.style.transformOrigin = `${g.left - r.left}px ${g.top - r.top}px`
++            el.style.transform =
++                `translate(${left - g.left}px, ${top - g.top}px) scale(${ratio})`
++        })
      }
      pinchEnd() {
 +        this.#flushPinch()
++        this.#pinchGeom = null
++        this.#touchTrack = null
++        this.#touchMid = null
          if (this.#scrollMode) {
              // Snapshot the centre page's on-screen rect from the still-scaled
              // preview, then drop the transform and resume paging. The committed
-@@ -2048,6 +2069,7 @@ export class FixedLayout extends HTMLElement {
+@@ -2048,6 +2178,7 @@ export class FixedLayout extends HTMLElement {
              if (this.#scrollContainer) {
                  this.#pinchAnchor = this.#captureCenterPageRect()
                  this.#scrollContainer.style.removeProperty('transform')
@@ -77,7 +218,7 @@ index e791285..a3f1428 100644
                  this.#scrollContainer.style.removeProperty('transform-origin')
              }
              return
-@@ -2063,6 +2085,7 @@ export class FixedLayout extends HTMLElement {
+@@ -2063,6 +2194,7 @@ export class FixedLayout extends HTMLElement {
          for (const frame of [this.#center, this.#left, this.#right]) {
              if (!frame?.element) continue
              frame.element.style.removeProperty('transform')
