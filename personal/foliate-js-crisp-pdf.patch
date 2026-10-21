@@ -1,8 +1,8 @@
 diff --git a/fixed-layout.js b/fixed-layout.js
-index e791285..32950ab 100644
+index e791285..8f720b9 100644
 --- a/fixed-layout.js
 +++ b/fixed-layout.js
-@@ -357,6 +357,17 @@ export class FixedLayout extends HTMLElement {
+@@ -357,6 +357,27 @@ export class FixedLayout extends HTMLElement {
      // placeholder layout (and thus scrollTop) can't drift mid-pinch, which would
      // make the live preview and the committed zoom land in different places.
      #pinching = false
@@ -14,59 +14,158 @@ index e791285..32950ab 100644
 +    // events themselves, and the geometry captured when a pinch starts. The
 +    // preview scales about the fingers and is clamped exactly the way the
 +    // committed layout will be, so letting go doesn't move the page.
-+    #touchTrack = null
++    // Every finger currently down, across all page iframes and the host, keyed by
++    // touch identifier. Each page iframe only ever reports its own fingers, so
++    // this is the one place that sees a pinch spanning two pages.
++    #touches = new Map()
++    #frameOf = new WeakMap()
 +    #touchMid = null
++    // The fingers' midpoint at the moment they lifted. The app learns about the
++    // release a little later (it comes through postMessage), by which time the
++    // next gesture may already be moving #touchMid.
++    #frozenMid = null
++    #pinchTimer = 0
++    #merging = false
 +    #pinchGeom = null
      // On-screen rect of the page under the viewport centre, captured from the
      // live (still-transformed) preview at pinch end ({ index, top, left }). The
      // commit re-render scrolls that page back to this exact rect, so the zoom
-@@ -532,6 +543,9 @@ export class FixedLayout extends HTMLElement {
+@@ -532,6 +553,9 @@ export class FixedLayout extends HTMLElement {
          }`)
  
          this.#observer.observe(this)
 +        const opts = { passive: true, capture: true }
-+        this.addEventListener('touchstart', e => this.#onTouch(e, true), opts)
-+        this.addEventListener('touchmove', e => this.#onTouch(e, false), opts)
++        for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel'])
++            this.addEventListener(type, e => this.#trackTouch(e, type, null, null), opts)
      }
      attributeChangedCallback(name, _, value) {
          switch (name) {
-@@ -654,6 +668,35 @@ export class FixedLayout extends HTMLElement {
+@@ -654,6 +678,124 @@ export class FixedLayout extends HTMLElement {
          this.#lockedPanX = null
          this.style.removeProperty('--locked-pan-x')
      }
-+    // Midpoint of a two-finger touch in host viewport coordinates. Inside a page
-+    // iframe, client coordinates are the iframe's own, so they are offset by the
-+    // iframe's on-screen rect at the start of the gesture; after that only the
-+    // screen-coordinate movement is used (client coordinates oscillate while the
-+    // preview transform is applied).
-+    #onTouch(e, start, iframe, doc) {
-+        if (e.touches.length < 2) return
-+        const [a, b] = [e.touches[0], e.touches[1]]
-+        const sx = (a.screenX + b.screenX) / 2
-+        const sy = (a.screenY + b.screenY) / 2
-+        if (start || !this.#touchTrack) {
-+            let wx = (a.clientX + b.clientX) / 2
-+            let wy = (a.clientY + b.clientY) / 2
-+            if (iframe) {
-+                const r = iframe.getBoundingClientRect()
-+                const { clientWidth, clientHeight } = doc.documentElement
-+                wx = r.left + wx * (clientWidth ? r.width / clientWidth : 1)
-+                wy = r.top + wy * (clientHeight ? r.height / clientHeight : 1)
++    // Page-iframe client coordinates -> host viewport coordinates (valid while
++    // no pinch transform is applied; afterwards only screen movement is used).
++    #toWindow(iframe, doc, x, y) {
++        const r = iframe.getBoundingClientRect()
++        const { clientWidth, clientHeight } = doc.documentElement
++        return [
++            r.left + x * (clientWidth ? r.width / clientWidth : 1),
++            r.top + y * (clientHeight ? r.height / clientHeight : 1),
++        ]
++    }
++    #windowOf(rec) {
++        return [rec.wx0 + rec.sx - rec.sx0, rec.wy0 + rec.sy - rec.sy0]
++    }
++    #trackTouch(e, type, doc, iframe) {
++        if (this.#merging) return
++        const ending = type === 'touchend' || type === 'touchcancel'
++        const changed = Array.from(e.changedTouches)
++        const midBefore = this.#touchMid
++        const docsBefore = new Set([...this.#touches.values()].map(r => r.doc))
++        const firstBefore = this.#touches.values().next().value
++        const endedRecs = []
++        if (ending) {
++            for (const t of changed) {
++                const rec = this.#touches.get(t.identifier)
++                if (rec) { endedRecs.push([t.identifier, rec]); this.#touches.delete(t.identifier) }
 +            }
-+            this.#touchTrack = { wx, wy, sx, sy }
++        } else {
++            for (const t of changed) {
++                let rec = this.#touches.get(t.identifier)
++                if (!rec || type === 'touchstart') {
++                    const [wx, wy] = iframe
++                        ? this.#toWindow(iframe, doc, t.clientX, t.clientY)
++                        : [t.clientX, t.clientY]
++                    rec = { doc, wx0: wx, wy0: wy, sx0: t.screenX, sy0: t.screenY }
++                    this.#touches.set(t.identifier, rec)
++                }
++                rec.sx = t.screenX
++                rec.sy = t.screenY
++            }
 +        }
-+        const t = this.#touchTrack
-+        this.#touchMid = { x: t.wx + sx - t.sx, y: t.wy + sy - t.sy }
++        // Forget fingers of this document whose end event never arrived.
++        const alive = new Set(Array.from(e.touches, t => t.identifier))
++        for (const [id, rec] of this.#touches)
++            if (rec.doc === doc && !alive.has(id)) this.#touches.delete(id)
++
++        const recs = [...this.#touches.values()]
++        if (recs.length >= 2) {
++            const [a, b] = recs.slice(0, 2).map(r => this.#windowOf(r))
++            this.#touchMid = { x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2 }
++        } else if (!recs.length) this.#touchMid = null
++
++        // Fingers lifted: freeze the preview where it is until the app commits.
++        if (ending && this.#pinchGeom && !this.#frozenMid && recs.length < 2) {
++            this.#frozenMid = midBefore ?? this.#touchMid
++            this.#flushPinch()
++            clearTimeout(this.#pinchTimer)
++            this.#pinchTimer = setTimeout(() => this.#cancelPinch(), 4000)
++        }
++
++        // Fingers on two different page iframes: no single document sees both
++        // fingers, so the app could never recognise a pinch. Swallow the event
++        // and hand the app one merged event, as if both were on the first page.
++        const docs = ending ? docsBefore : new Set(recs.map(r => r.doc))
++        if (docs.size < 2 || docs.has(null)) return
++        const primary = firstBefore?.doc ?? recs[0]?.doc
++        const frame = primary && this.#frameOf.get(primary)
++        const view = primary?.defaultView
++        if (!frame || !view?.Touch || !view?.TouchEvent) return
++        try {
++            const mk = (id, rec) => {
++                const [wx, wy] = this.#windowOf(rec)
++                const r = frame.getBoundingClientRect()
++                const { clientWidth, clientHeight } = primary.documentElement
++                const x = (wx - r.left) / (clientWidth ? r.width / clientWidth : 1)
++                const y = (wy - r.top) / (clientHeight ? r.height / clientHeight : 1)
++                return new view.Touch({
++                    identifier: id, target: primary.documentElement,
++                    clientX: x, clientY: y, pageX: x, pageY: y,
++                    screenX: rec.sx, screenY: rec.sy,
++                })
++            }
++            const live = [...this.#touches].map(([id, rec]) => mk(id, rec))
++            const moved = ending
++                ? endedRecs.map(([id, rec]) => mk(id, rec))
++                : changed.map(t => mk(t.identifier, this.#touches.get(t.identifier)))
++            const ev = new view.TouchEvent(type, {
++                touches: live, targetTouches: live, changedTouches: moved,
++                bubbles: true, cancelable: true, composed: true, view,
++            })
++            e.stopImmediatePropagation()
++            this.#merging = true
++            try { primary.documentElement.dispatchEvent(ev) } finally { this.#merging = false }
++        } catch {}
 +    }
 +    #trackTouches(doc, iframe) {
-+        const opts = { passive: true, capture: true }
-+        doc.addEventListener('touchstart', e => this.#onTouch(e, true, iframe, doc), opts)
-+        doc.addEventListener('touchmove', e => this.#onTouch(e, false, iframe, doc), opts)
++        const win = doc.defaultView
++        if (!win) return
++        this.#frameOf.set(doc, iframe)
++        for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel'])
++            win.addEventListener(type, e => this.#trackTouch(e, type, doc, iframe),
++                { capture: true, passive: true })
++    }
++    // The app never ended this pinch (no touchend reached it): put the page back.
++    #cancelPinch() {
++        clearTimeout(this.#pinchTimer)
++        if (this.#pinchRaf) cancelAnimationFrame(this.#pinchRaf)
++        this.#pinchRaf = 0
++        this.#pinchGeom = null
++        this.#frozenMid = null
++        this.#pinching = false
++        for (const el of [this.#scrollContainer,
++            ...[this.#center, this.#left, this.#right].map(f => f?.element)]) {
++            if (!el) continue
++            el.style.removeProperty('transform')
++            el.style.removeProperty('will-change')
++            el.style.removeProperty('transform-origin')
++        }
 +    }
      async #createFrame({ index, src: srcOption, detached = false }) {
          const srcOptionIsString = typeof srcOption === 'string'
          const src = srcOptionIsString ? srcOption : srcOption?.src
-@@ -689,6 +732,7 @@ export class FixedLayout extends HTMLElement {
+@@ -689,6 +831,7 @@ export class FixedLayout extends HTMLElement {
              iframe.addEventListener('load', async () => {
                  const doc = iframe.contentDocument
                  this.#applyPanLock(doc)
@@ -74,7 +173,15 @@ index e791285..32950ab 100644
                  iframe.dataset.sectionIndex = index
                  this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                  const { width, height } = await getViewport(doc, this.defaultViewport)
-@@ -2006,15 +2050,73 @@ export class FixedLayout extends HTMLElement {
+@@ -1234,6 +1377,7 @@ export class FixedLayout extends HTMLElement {
+             iframe.addEventListener('load', async () => {
+                 const doc = iframe.contentDocument
+                 this.#applyPanLock(doc)
++                this.#trackTouches(doc, iframe)
+                 iframe.dataset.sectionIndex = pageData.index
+                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
+                 const { width, height } = await getViewport(doc, this.defaultViewport)
+@@ -2006,15 +2150,73 @@ export class FixedLayout extends HTMLElement {
                  }
              })
      }
@@ -137,7 +244,7 @@ index e791285..32950ab 100644
 +        const ratio = this.#pinchRatio
 +        const g = this.#pinchGeom
 +        if (!g) return
-+        const cur = this.#touchMid ?? g.pivot
++        const cur = this.#frozenMid ?? this.#touchMid ?? g.pivot
          // Scroll mode: scale the whole scroll container so the zoom tracks the
 -        // fingers live, anchored at the viewport centre. Suppress paging and
 -        // snapshot the centre anchor on the first move so the layout stays still
@@ -154,7 +261,7 @@ index e791285..32950ab 100644
                  const { transform, transformOrigin } = computeScrollPinchTransform({
                      ratio,
                      scrollLeft: this.#scrollHorizontal && this.rtl
-@@ -2026,19 +2128,47 @@ export class FixedLayout extends HTMLElement {
+@@ -2026,19 +2228,47 @@ export class FixedLayout extends HTMLElement {
                  })
                  this.#scrollContainer.style.transformOrigin = transformOrigin
                  this.#scrollContainer.style.transform = transform
@@ -205,12 +312,12 @@ index e791285..32950ab 100644
      pinchEnd() {
 +        this.#flushPinch()
 +        this.#pinchGeom = null
-+        this.#touchTrack = null
-+        this.#touchMid = null
++        clearTimeout(this.#pinchTimer)
++        this.#frozenMid = null
          if (this.#scrollMode) {
              // Snapshot the centre page's on-screen rect from the still-scaled
              // preview, then drop the transform and resume paging. The committed
-@@ -2048,6 +2178,7 @@ export class FixedLayout extends HTMLElement {
+@@ -2048,6 +2278,7 @@ export class FixedLayout extends HTMLElement {
              if (this.#scrollContainer) {
                  this.#pinchAnchor = this.#captureCenterPageRect()
                  this.#scrollContainer.style.removeProperty('transform')
@@ -218,7 +325,7 @@ index e791285..32950ab 100644
                  this.#scrollContainer.style.removeProperty('transform-origin')
              }
              return
-@@ -2063,6 +2194,7 @@ export class FixedLayout extends HTMLElement {
+@@ -2063,6 +2294,7 @@ export class FixedLayout extends HTMLElement {
          for (const frame of [this.#center, this.#left, this.#right]) {
              if (!frame?.element) continue
              frame.element.style.removeProperty('transform')
@@ -227,10 +334,10 @@ index e791285..32950ab 100644
          }
      }
 diff --git a/pdf.js b/pdf.js
-index 27e060c..948b2fd 100644
+index 27e060c..8d5b4c4 100644
 --- a/pdf.js
 +++ b/pdf.js
-@@ -396,17 +396,17 @@ export const setupPanningEvents = (doc) => {
+@@ -396,17 +396,18 @@ export const setupPanningEvents = (doc) => {
  // device pixel ratio. Phones report dpr 3, which is the tipping factor.
  // Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
  // per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
@@ -247,11 +354,90 @@ index 27e060c..948b2fd 100644
  // and the reader reloads (readest #6521). pdf.js downscales anything larger, and
  // Readest's worker hook does so without the full-size intermediate bitmap.
 -const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
++const MAX_DESKTOP_CANVAS_PIXELS = 4096 * 4096
 +const MAX_IMAGE_BYTES = 4 * (2048 * 1536) * 4
  
  // Only mobile WebViews get that budget. Desktop browsers have no per-process
  // memory ceiling, and a page fitted to a desktop window is several times the
-@@ -640,18 +640,46 @@ const render = async (page, doc, zoom, pageColors) => {
+@@ -425,12 +426,15 @@ const isMobileWebView = () => {
+ // budget. Never below 1 (CSS resolution).
+ const getRenderDpr = (page, zoom) => {
+     let dpr = devicePixelRatio || 1
+-    if (isMobileWebView()) {
+-        dpr = Math.min(dpr, MAX_RENDER_DPR)
+-        const { width, height } = page.getViewport({ scale: zoom || 1 })
+-        const area = width * height * dpr * dpr
+-        if (area > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+-    }
++    const mobile = isMobileWebView()
++    if (mobile) dpr = Math.min(dpr, MAX_RENDER_DPR)
++    // A big page zoomed in can ask for a bitmap of tens of megapixels (hundreds
++    // of MB, seconds to draw). Past the cap the bitmap is stretched instead,
++    // exactly as pdf.js's own viewer does at 16.7 Mpx.
++    const cap = mobile ? MAX_CANVAS_PIXELS : MAX_DESKTOP_CANVAS_PIXELS
++    const { width, height } = page.getViewport({ scale: zoom || 1 })
++    const area = width * height * dpr * dpr
++    if (area > cap) dpr *= Math.sqrt(cap / area)
+     return Math.max(1, dpr)
+ }
+ 
+@@ -587,7 +591,54 @@ const getRenderOperatorList = (page, renderTask) => {
+             if (task.task === renderTask) return operatorList
+ }
+ 
+-const render = async (page, doc, zoom, pageColors) => {
++// Per document: the page + font scale its text/annotation layers were built for.
++const layersBuilt = new WeakMap()
++// Per document: the last page and zoom asked for, and a zoom redraw that is
++// waiting for the zooming to pause.
++const lastRequest = new WeakMap()
++const pendingZoom = new WeakMap()
++const ZOOM_REDRAW_DELAY = 120
++
++// A zoom change (pinch, keyboard step, slider) shows the old bitmap stretched to
++// the new size straight away and only redraws the sharp one once the zooming
++// pauses. Redrawing on every step just starts and cancels expensive renders,
++// and a half-finished one would land at the old size and flash.
++const render = (page, doc, zoom, pageColors) => {
++    if (!doc) return
++    const pending = pendingZoom.get(doc)
++    if (pending) {
++        clearTimeout(pending.timer)
++        pendingZoom.delete(doc)
++        pending.resolve()
++    }
++    const last = lastRequest.get(doc)
++    lastRequest.set(doc, { page, zoom })
++    if (!(last && last.page === page && last.zoom !== zoom))
++        return renderNow(page, doc, zoom, pageColors)
++
++    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
++    const viewport = page.getViewport({ scale: zoom })
++    const stale = doc.querySelector('#canvas canvas')
++    if (stale) {
++        stale.style.width = `${viewport.width}px`
++        stale.style.height = `${viewport.height}px`
++    }
++    // Drop whatever is still drawing for the old zoom, and make sure the redraw
++    // below isn't skipped as "already rendered".
++    renderGenerations.set(doc, (renderGenerations.get(doc) || 0) + 1)
++    activeRenderTasks.get(doc)?.cancel()
++    activeRenderTasks.delete(doc)
++    renderedFor.delete(doc)
++    return new Promise(resolve => {
++        const timer = setTimeout(() => {
++            pendingZoom.delete(doc)
++            renderNow(page, doc, zoom, pageColors).then(resolve, resolve)
++        }, ZOOM_REDRAW_DELAY)
++        pendingZoom.set(doc, { timer, resolve })
++    })
++}
++
++const renderNow = async (page, doc, zoom, pageColors) => {
+     if (!doc) return
+ 
+     // Rendering tears the text layer down and builds it again, which detaches
+@@ -640,18 +691,46 @@ const render = async (page, doc, zoom, pageColors) => {
      const renderViewport = page.getViewport({ scale: renderScale })
      const displayViewport = page.getViewport({ scale: zoom })
  
@@ -307,3 +493,29 @@ index 27e060c..948b2fd 100644
      const canvasContext = canvas.getContext('2d')
      const renderTask = page.render({ canvasContext, viewport: renderViewport })
      activeRenderTasks.set(doc, renderTask)
+@@ -709,6 +788,17 @@ const render = async (page, doc, zoom, pageColors) => {
+         return rect ? () => renderRegion(page, renderScale, rect) : null
+     }
+ 
++    // The text and annotation layers are positioned in percentages of the page
++    // and sized from --total-scale-factor, so a zoom change alone doesn't touch
++    // them. Rebuilding thousands of spans on every zoom step was a large part of
++    // the delay on big pages (and it detached every Range held into the text).
++    const built = layersBuilt.get(doc)
++    if (built?.page === page && built.fontScale === getFontScale(doc)
++        && doc.querySelector('.textLayer .endOfContent')
++        // only when the spans are sized by CSS variables (newer pdf.js)
++        && doc.querySelector('.textLayer span')?.style.getPropertyValue('--font-height')) return
++    layersBuilt.delete(doc)
++
+     // Clear text layer before re-rendering to prevent DOM accumulation
+     const container = doc.querySelector('.textLayer')
+     container.replaceChildren()
+@@ -768,6 +858,7 @@ const render = async (page, doc, zoom, pageColors) => {
+     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
+         annotations: await page.getAnnotations(),
+     })
++    layersBuilt.set(doc, { page, fontScale })
+ }
+ 
+ const renderPage = async (page, getImageBlob) => {
