@@ -1,27 +1,22 @@
 --- a/pdf.js
 +++ b/pdf.js
-@@ -405,17 +405,18 @@
+@@ -405,7 +405,7 @@
  // device pixel ratio. Phones report dpr 3, which is the tipping factor.
  // Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
  // per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
 -const MAX_RENDER_DPR = 2
-+const MAX_RENDER_DPR = 4
++const MAX_RENDER_DPR = 3
  // Hard ceiling on a single page's bitmap area (~3.1 Mpx ≈ 12.6 MB) so a large
  // tablet page can't blow the budget even after the dpr clamp.
--const MAX_CANVAS_PIXELS = 2048 * 1536
-+const MAX_CANVAS_PIXELS = 4096 * 3072
- // Ceiling on a decoded image (4 bytes per pixel), a few times the page budget so
- // zooming still has detail. Scanned scores carry 1-bit ~9000x12000 px pages that
- // pdf.js would otherwise decode to ~430 MB bitmaps; iOS holds those in the WebKit
+ const MAX_CANVAS_PIXELS = 2048 * 1536
+@@ -415,6 +415,7 @@
  // GPU process, which jetsam kills past ~300 MB until WebKit gives up on the page
  // and the reader reloads (readest #6521). pdf.js downscales anything larger, and
  // Readest's worker hook does so without the full-size intermediate bitmap.
--const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
 +const MAX_DESKTOP_CANVAS_PIXELS = 4096 * 4096
-+const MAX_IMAGE_BYTES = 4 * (2048 * 1536) * 4
+ const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
  
  // Only mobile WebViews get that budget. Desktop browsers have no per-process
- // memory ceiling, and a page fitted to a desktop window is several times the
 @@ -434,12 +435,15 @@
  // budget. Never below 1 (CSS resolution).
  const getRenderDpr = (page, zoom) => {
@@ -44,13 +39,11 @@
      return Math.max(1, dpr)
  }
  
-@@ -809,7 +813,56 @@
+@@ -809,7 +813,55 @@
              if (task.task === renderTask) return operatorList
  }
  
 -const render = async (page, doc, zoom, pageColors) => {
-+// Per document: the page + font scale its text/annotation layers were built for.
-+const layersBuilt = new WeakMap()
 +// Per document: the last page and zoom asked for, and a zoom redraw that is
 +// waiting for the zooming to pause.
 +const lastRequest = new WeakMap()
@@ -76,6 +69,7 @@
 +
 +    // The detail canvas covers the old zoom's pixels, so it goes until the redraw.
 +    dropDetail(doc)
++    detailSources.set(doc, null)
 +    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
 +    const viewport = page.getViewport({ scale: zoom })
 +    const stale = doc.querySelector('#canvas canvas')
@@ -102,32 +96,20 @@
      if (!doc) return
  
      // Rendering tears the text layer down and builds it again, which detaches
-@@ -945,6 +998,17 @@
-         return rect ? () => renderRegion(page, renderScale, rect) : null
-     }
- 
-+    // The text and annotation layers are positioned in percentages of the page
-+    // and sized from --total-scale-factor, so a zoom change alone doesn't touch
-+    // them. Rebuilding thousands of spans on every zoom step was a large part of
-+    // the delay on big pages (and it detached every Range held into the text).
-+    const built = layersBuilt.get(doc)
-+    if (built?.page === page && built.fontScale === getFontScale(doc)
-+        && doc.querySelector('.textLayer .endOfContent')
-+        // only when the spans are sized by CSS variables (newer pdf.js)
-+        && doc.querySelector('.textLayer span')?.style.getPropertyValue('--font-height')) return
-+    layersBuilt.delete(doc)
-+
-     // Clear text layer before re-rendering to prevent DOM accumulation
-     const container = doc.querySelector('.textLayer')
-     container.replaceChildren()
-@@ -1004,6 +1068,7 @@
-     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
-         annotations: await page.getAnnotations(),
-     })
-+    layersBuilt.set(doc, { page, fontScale })
- }
- 
- const renderPage = async (page, getImageBlob) => {
+@@ -829,6 +881,13 @@
+     const generation = (renderGenerations.get(doc) || 0) + 1
+     renderGenerations.set(doc, generation)
+     renderedFor.set(doc, { page, signature, generation })
++    // A detail canvas is drawn from the last finished render's zoom. While this
++    // render runs it would be drawn at the wrong scale (and cut a hole in the
++    // page bitmap), so none is drawn until this render sets a new source.
++    if (detailSources.has(doc)) {
++        dropDetail(doc)
++        detailSources.set(doc, null)
++    }
+     // Let a later render retry after this one bails without replacing the DOM.
+     // A newer render overwrites the entry with its own generation, so only the
+     // render that still owns it clears it.
 --- a/fixed-layout.js
 +++ b/fixed-layout.js
 @@ -366,6 +366,27 @@
@@ -168,7 +150,7 @@
      }
      attributeChangedCallback(name, oldValue, value) {
          if (oldValue === value) return
-@@ -676,6 +700,124 @@
+@@ -676,6 +700,137 @@
          this.#lockedPanX = null
          this.style.removeProperty('--locked-pan-x')
      }
@@ -190,8 +172,16 @@
 +        const ending = type === 'touchend' || type === 'touchcancel'
 +        const changed = Array.from(e.changedTouches)
 +        const midBefore = this.#touchMid
-+        const docsBefore = new Set([...this.#touches.values()].map(r => r.doc))
-+        const firstBefore = this.#touches.values().next().value
++        const now = performance.now()
++        // A finger whose page was replaced (page turn, reload) or that hasn't
++        // been heard from for a while is not really down; it must never make a
++        // one-finger touch look like a two-page pinch.
++        const fresh = r => (!r.doc || r.doc.defaultView?.frameElement?.isConnected)
++            && now - r.seen < 2000
++        for (const [id, r] of this.#touches)
++            if (r.doc && !r.doc.defaultView?.frameElement?.isConnected) this.#touches.delete(id)
++        const docsBefore = new Set([...this.#touches.values()].filter(fresh).map(r => r.doc))
++        const firstBefore = [...this.#touches.values()].find(fresh)
 +        const endedRecs = []
 +        if (ending) {
 +            for (const t of changed) {
@@ -205,17 +195,21 @@
 +                    const [wx, wy] = iframe
 +                        ? this.#toWindow(iframe, doc, t.clientX, t.clientY)
 +                        : [t.clientX, t.clientY]
-+                    rec = { doc, wx0: wx, wy0: wy, sx0: t.screenX, sy0: t.screenY }
++                    rec = { doc, wx0: wx, wy0: wy, sx0: t.screenX, sy0: t.screenY, seen: now }
 +                    this.#touches.set(t.identifier, rec)
 +                }
 +                rec.sx = t.screenX
 +                rec.sy = t.screenY
++                rec.seen = now
 +            }
 +        }
 +        // Forget fingers of this document whose end event never arrived.
 +        const alive = new Set(Array.from(e.touches, t => t.identifier))
 +        for (const [id, rec] of this.#touches)
-+            if (rec.doc === doc && !alive.has(id)) this.#touches.delete(id)
++            if (rec.doc === doc) {
++                if (alive.has(id)) rec.seen = now
++                else this.#touches.delete(id)
++            }
 +
 +        const recs = [...this.#touches.values()]
 +        if (recs.length >= 2) {
@@ -234,7 +228,8 @@
 +        // Fingers on two different page iframes: no single document sees both
 +        // fingers, so the app could never recognise a pinch. Swallow the event
 +        // and hand the app one merged event, as if both were on the first page.
-+        const docs = ending ? docsBefore : new Set(recs.map(r => r.doc))
++        const docs = ending ? docsBefore
++            : new Set(recs.filter(fresh).map(r => r.doc))
 +        if (docs.size < 2 || docs.has(null)) return
 +        const primary = firstBefore?.doc ?? recs[0]?.doc
 +        const frame = primary && this.#frameOf.get(primary)
@@ -293,7 +288,7 @@
      async #createFrame({ index, src: srcOption, detached = false }) {
          const srcOptionIsString = typeof srcOption === 'string'
          const src = srcOptionIsString ? srcOption : srcOption?.src
-@@ -711,6 +853,7 @@
+@@ -711,6 +866,7 @@
              iframe.addEventListener('load', async () => {
                  const doc = iframe.contentDocument
                  this.#applyPanLock(doc)
@@ -301,7 +296,7 @@
                  iframe.dataset.sectionIndex = index
                  this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                  const { width, height } = await getViewport(doc, this.defaultViewport)
-@@ -1293,6 +1436,7 @@
+@@ -1293,6 +1449,7 @@
              iframe.addEventListener('load', async () => {
                  const doc = iframe.contentDocument
                  this.#applyPanLock(doc)
@@ -309,7 +304,7 @@
                  iframe.dataset.sectionIndex = pageData.index
                  this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                  const { width, height } = await getViewport(doc, this.defaultViewport)
-@@ -2297,15 +2441,74 @@
+@@ -2297,15 +2454,74 @@
                  }
              })
      }
@@ -390,7 +385,7 @@
                  const { transform, transformOrigin } = computeScrollPinchTransform({
                      ratio,
                      scrollLeft: this.#scrollHorizontal && this.rtl
-@@ -2317,26 +2520,42 @@
+@@ -2317,26 +2533,42 @@
                  })
                  this.#scrollContainer.style.transformOrigin = transformOrigin
                  this.#scrollContainer.style.transform = transform
@@ -450,7 +445,7 @@
      }
      // The paginated pages on screen. Portrait shows one page of a spread and
      // hides the other with display: none, which has no rect to anchor on.
-@@ -2354,6 +2573,7 @@
+@@ -2354,6 +2586,7 @@
              if (this.#scrollContainer) {
                  this.#pinchAnchor = this.#captureCenterPageRect()
                  this.#scrollContainer.style.removeProperty('transform')
@@ -458,7 +453,7 @@
                  this.#scrollContainer.style.removeProperty('transform-origin')
              }
              return
-@@ -2369,6 +2589,7 @@
+@@ -2369,6 +2602,7 @@
          for (const frame of [this.#center, this.#left, this.#right]) {
              if (!frame?.element) continue
              frame.element.style.removeProperty('transform')
