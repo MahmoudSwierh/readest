@@ -1,8 +1,136 @@
-diff --git a/fixed-layout.js b/fixed-layout.js
-index e791285..8f720b9 100644
+--- a/pdf.js
++++ b/pdf.js
+@@ -405,17 +405,18 @@
+ // device pixel ratio. Phones report dpr 3, which is the tipping factor.
+ // Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
+ // per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
+-const MAX_RENDER_DPR = 2
++const MAX_RENDER_DPR = 4
+ // Hard ceiling on a single page's bitmap area (~3.1 Mpx ≈ 12.6 MB) so a large
+ // tablet page can't blow the budget even after the dpr clamp.
+-const MAX_CANVAS_PIXELS = 2048 * 1536
++const MAX_CANVAS_PIXELS = 4096 * 3072
+ // Ceiling on a decoded image (4 bytes per pixel), a few times the page budget so
+ // zooming still has detail. Scanned scores carry 1-bit ~9000x12000 px pages that
+ // pdf.js would otherwise decode to ~430 MB bitmaps; iOS holds those in the WebKit
+ // GPU process, which jetsam kills past ~300 MB until WebKit gives up on the page
+ // and the reader reloads (readest #6521). pdf.js downscales anything larger, and
+ // Readest's worker hook does so without the full-size intermediate bitmap.
+-const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
++const MAX_DESKTOP_CANVAS_PIXELS = 4096 * 4096
++const MAX_IMAGE_BYTES = 4 * (2048 * 1536) * 4
+ 
+ // Only mobile WebViews get that budget. Desktop browsers have no per-process
+ // memory ceiling, and a page fitted to a desktop window is several times the
+@@ -434,12 +435,15 @@
+ // budget. Never below 1 (CSS resolution).
+ const getRenderDpr = (page, zoom) => {
+     let dpr = devicePixelRatio || 1
+-    if (isMobileWebView()) {
+-        dpr = Math.min(dpr, MAX_RENDER_DPR)
+-        const { width, height } = page.getViewport({ scale: zoom || 1 })
+-        const area = width * height * dpr * dpr
+-        if (area > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+-    }
++    const mobile = isMobileWebView()
++    if (mobile) dpr = Math.min(dpr, MAX_RENDER_DPR)
++    // A big page zoomed in can ask for a bitmap of tens of megapixels (hundreds
++    // of MB, seconds to draw). Past the cap the bitmap is stretched instead,
++    // exactly as pdf.js's own viewer does at 16.7 Mpx.
++    const cap = mobile ? MAX_CANVAS_PIXELS : MAX_DESKTOP_CANVAS_PIXELS
++    const { width, height } = page.getViewport({ scale: zoom || 1 })
++    const area = width * height * dpr * dpr
++    if (area > cap) dpr *= Math.sqrt(cap / area)
+     return Math.max(1, dpr)
+ }
+ 
+@@ -809,7 +813,56 @@
+             if (task.task === renderTask) return operatorList
+ }
+ 
+-const render = async (page, doc, zoom, pageColors) => {
++// Per document: the page + font scale its text/annotation layers were built for.
++const layersBuilt = new WeakMap()
++// Per document: the last page and zoom asked for, and a zoom redraw that is
++// waiting for the zooming to pause.
++const lastRequest = new WeakMap()
++const pendingZoom = new WeakMap()
++const ZOOM_REDRAW_DELAY = 120
++
++// A zoom change (pinch, keyboard step, slider) shows the old bitmap stretched to
++// the new size straight away and only redraws the sharp one once the zooming
++// pauses. Redrawing on every step just starts and cancels expensive renders,
++// and a half-finished one would land at the old size and flash.
++const render = (page, doc, zoom, pageColors) => {
++    if (!doc) return
++    const pending = pendingZoom.get(doc)
++    if (pending) {
++        clearTimeout(pending.timer)
++        pendingZoom.delete(doc)
++        pending.resolve()
++    }
++    const last = lastRequest.get(doc)
++    lastRequest.set(doc, { page, zoom })
++    if (!(last && last.page === page && last.zoom !== zoom))
++        return renderNow(page, doc, zoom, pageColors)
++
++    // The detail canvas covers the old zoom's pixels, so it goes until the redraw.
++    dropDetail(doc)
++    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
++    const viewport = page.getViewport({ scale: zoom })
++    const stale = doc.querySelector('#canvas canvas')
++    if (stale) {
++        stale.style.width = `${viewport.width}px`
++        stale.style.height = `${viewport.height}px`
++    }
++    // Drop whatever is still drawing for the old zoom, and make sure the redraw
++    // below isn't skipped as "already rendered".
++    renderGenerations.set(doc, (renderGenerations.get(doc) || 0) + 1)
++    activeRenderTasks.get(doc)?.cancel()
++    activeRenderTasks.delete(doc)
++    renderedFor.delete(doc)
++    return new Promise(resolve => {
++        const timer = setTimeout(() => {
++            pendingZoom.delete(doc)
++            renderNow(page, doc, zoom, pageColors).then(resolve, resolve)
++        }, ZOOM_REDRAW_DELAY)
++        pendingZoom.set(doc, { timer, resolve })
++    })
++}
++
++const renderNow = async (page, doc, zoom, pageColors) => {
+     if (!doc) return
+ 
+     // Rendering tears the text layer down and builds it again, which detaches
+@@ -945,6 +998,17 @@
+         return rect ? () => renderRegion(page, renderScale, rect) : null
+     }
+ 
++    // The text and annotation layers are positioned in percentages of the page
++    // and sized from --total-scale-factor, so a zoom change alone doesn't touch
++    // them. Rebuilding thousands of spans on every zoom step was a large part of
++    // the delay on big pages (and it detached every Range held into the text).
++    const built = layersBuilt.get(doc)
++    if (built?.page === page && built.fontScale === getFontScale(doc)
++        && doc.querySelector('.textLayer .endOfContent')
++        // only when the spans are sized by CSS variables (newer pdf.js)
++        && doc.querySelector('.textLayer span')?.style.getPropertyValue('--font-height')) return
++    layersBuilt.delete(doc)
++
+     // Clear text layer before re-rendering to prevent DOM accumulation
+     const container = doc.querySelector('.textLayer')
+     container.replaceChildren()
+@@ -1004,6 +1068,7 @@
+     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
+         annotations: await page.getAnnotations(),
+     })
++    layersBuilt.set(doc, { page, fontScale })
+ }
+ 
+ const renderPage = async (page, getImageBlob) => {
 --- a/fixed-layout.js
 +++ b/fixed-layout.js
-@@ -357,6 +357,27 @@ export class FixedLayout extends HTMLElement {
+@@ -366,6 +366,27 @@
      // placeholder layout (and thus scrollTop) can't drift mid-pinch, which would
      // make the live preview and the committed zoom land in different places.
      #pinching = false
@@ -30,7 +158,7 @@ index e791285..8f720b9 100644
      // On-screen rect of the page under the viewport centre, captured from the
      // live (still-transformed) preview at pinch end ({ index, top, left }). The
      // commit re-render scrolls that page back to this exact rect, so the zoom
-@@ -532,6 +553,9 @@ export class FixedLayout extends HTMLElement {
+@@ -552,6 +573,9 @@
          }`)
  
          this.#observer.observe(this)
@@ -38,9 +166,9 @@ index e791285..8f720b9 100644
 +        for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel'])
 +            this.addEventListener(type, e => this.#trackTouch(e, type, null, null), opts)
      }
-     attributeChangedCallback(name, _, value) {
-         switch (name) {
-@@ -654,6 +678,124 @@ export class FixedLayout extends HTMLElement {
+     attributeChangedCallback(name, oldValue, value) {
+         if (oldValue === value) return
+@@ -676,6 +700,124 @@
          this.#lockedPanX = null
          this.style.removeProperty('--locked-pan-x')
      }
@@ -165,7 +293,7 @@ index e791285..8f720b9 100644
      async #createFrame({ index, src: srcOption, detached = false }) {
          const srcOptionIsString = typeof srcOption === 'string'
          const src = srcOptionIsString ? srcOption : srcOption?.src
-@@ -689,6 +831,7 @@ export class FixedLayout extends HTMLElement {
+@@ -711,6 +853,7 @@
              iframe.addEventListener('load', async () => {
                  const doc = iframe.contentDocument
                  this.#applyPanLock(doc)
@@ -173,7 +301,7 @@ index e791285..8f720b9 100644
                  iframe.dataset.sectionIndex = index
                  this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                  const { width, height } = await getViewport(doc, this.defaultViewport)
-@@ -1234,6 +1377,7 @@ export class FixedLayout extends HTMLElement {
+@@ -1293,6 +1436,7 @@
              iframe.addEventListener('load', async () => {
                  const doc = iframe.contentDocument
                  this.#applyPanLock(doc)
@@ -181,7 +309,7 @@ index e791285..8f720b9 100644
                  iframe.dataset.sectionIndex = pageData.index
                  this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                  const { width, height } = await getViewport(doc, this.defaultViewport)
-@@ -2006,15 +2150,73 @@ export class FixedLayout extends HTMLElement {
+@@ -2297,15 +2441,74 @@
                  }
              })
      }
@@ -200,8 +328,9 @@ index e791285..8f720b9 100644
 +                g.ch = this.#scrollContainer.offsetHeight
 +            }
 +        } else {
-+            const frames = (this.#center ? [this.#center] : [this.#left, this.#right])
-+                .filter(f => f?.element && f.element.style.visibility !== 'hidden')
++            // Portrait hides the other page of a spread with display: none.
++            const frames = this.#shownFrames()
++                .filter(f => f.element.style.visibility !== 'hidden')
 +            const rects = frames.map(f => f.element.getBoundingClientRect())
 +            if (frames.length) {
 +                g.mode = 'page'
@@ -261,7 +390,7 @@ index e791285..8f720b9 100644
                  const { transform, transformOrigin } = computeScrollPinchTransform({
                      ratio,
                      scrollLeft: this.#scrollHorizontal && this.rtl
-@@ -2026,19 +2228,47 @@ export class FixedLayout extends HTMLElement {
+@@ -2317,26 +2520,42 @@
                  })
                  this.#scrollContainer.style.transformOrigin = transformOrigin
                  this.#scrollContainer.style.transform = transform
@@ -281,18 +410,28 @@ index e791285..8f720b9 100644
 +            this.#scrollContainer.style.transform = `translate(${tx}px, ${sy - top}px) scale(${ratio})`
              return
          }
--        const frames = this.#center
--            ? [this.#center]
--            : [this.#left, this.#right]
--        for (const frame of frames) {
--            if (!frame?.element || frame.element.style.visibility === 'hidden') continue
--            frame.element.style.transform = `scale(${ratio})`
--            frame.element.style.transformOrigin = 'center'
+-        const elements = this.#shownFrames()
+-            .map(frame => frame.element)
+-            .filter(element => element.style.visibility !== 'hidden')
+-        if (!elements.length) return
+-        // Scale the shown pages as one spread around its centre, which is how
+-        // the committed zoom lays them out. Scaling each page around its own
+-        // centre pulled the two pages of a spread apart, and the release
+-        // jumped sideways (readest#6941). Offsets ignore the transform, so the
+-        // origin holds still across moves.
+-        const left = Math.min(...elements.map(el => el.offsetLeft))
+-        const top = Math.min(...elements.map(el => el.offsetTop))
+-        const right = Math.max(...elements.map(el => el.offsetLeft + el.offsetWidth))
+-        const bottom = Math.max(...elements.map(el => el.offsetTop + el.offsetHeight))
+-        for (const element of elements) {
+-            element.style.transform = `scale(${ratio})`
+-            element.style.transformOrigin = `${(left + right) / 2 - element.offsetLeft}px ${(top + bottom) / 2 - element.offsetTop}px`
 -        }
 +        if (g.mode !== 'page') return
 +        // Where the page (or spread) will sit once committed: centred while it
 +        // fits the viewport, otherwise kept under the fingers but never scrolled
-+        // past its own edges.
++        // past its own edges. Every shown page scales about the same point, so a
++        // spread stays together (readest#6941).
 +        const place = (start, size, view, hostStart, pivot, now) => {
 +            const next = size * ratio
 +            if (next <= view) return hostStart + (view - next) / 2
@@ -309,15 +448,9 @@ index e791285..8f720b9 100644
 +                `translate(${left - g.left}px, ${top - g.top}px) scale(${ratio})`
 +        })
      }
-     pinchEnd() {
-+        this.#flushPinch()
-+        this.#pinchGeom = null
-+        clearTimeout(this.#pinchTimer)
-+        this.#frozenMid = null
-         if (this.#scrollMode) {
-             // Snapshot the centre page's on-screen rect from the still-scaled
-             // preview, then drop the transform and resume paging. The committed
-@@ -2048,6 +2278,7 @@ export class FixedLayout extends HTMLElement {
+     // The paginated pages on screen. Portrait shows one page of a spread and
+     // hides the other with display: none, which has no rect to anchor on.
+@@ -2354,6 +2573,7 @@
              if (this.#scrollContainer) {
                  this.#pinchAnchor = this.#captureCenterPageRect()
                  this.#scrollContainer.style.removeProperty('transform')
@@ -325,7 +458,7 @@ index e791285..8f720b9 100644
                  this.#scrollContainer.style.removeProperty('transform-origin')
              }
              return
-@@ -2063,6 +2294,7 @@ export class FixedLayout extends HTMLElement {
+@@ -2369,6 +2589,7 @@
          for (const frame of [this.#center, this.#left, this.#right]) {
              if (!frame?.element) continue
              frame.element.style.removeProperty('transform')
@@ -333,189 +466,3 @@ index e791285..8f720b9 100644
              frame.element.style.removeProperty('transform-origin')
          }
      }
-diff --git a/pdf.js b/pdf.js
-index 27e060c..8d5b4c4 100644
---- a/pdf.js
-+++ b/pdf.js
-@@ -396,17 +396,18 @@ export const setupPanningEvents = (doc) => {
- // device pixel ratio. Phones report dpr 3, which is the tipping factor.
- // Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
- // per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
--const MAX_RENDER_DPR = 2
-+const MAX_RENDER_DPR = 4
- // Hard ceiling on a single page's bitmap area (~3.1 Mpx ≈ 12.6 MB) so a large
- // tablet page can't blow the budget even after the dpr clamp.
--const MAX_CANVAS_PIXELS = 2048 * 1536
-+const MAX_CANVAS_PIXELS = 4096 * 3072
- // Ceiling on a decoded image (4 bytes per pixel), a few times the page budget so
- // zooming still has detail. Scanned scores carry 1-bit ~9000x12000 px pages that
- // pdf.js would otherwise decode to ~430 MB bitmaps; iOS holds those in the WebKit
- // GPU process, which jetsam kills past ~300 MB until WebKit gives up on the page
- // and the reader reloads (readest #6521). pdf.js downscales anything larger, and
- // Readest's worker hook does so without the full-size intermediate bitmap.
--const MAX_IMAGE_BYTES = 4 * MAX_CANVAS_PIXELS * 4
-+const MAX_DESKTOP_CANVAS_PIXELS = 4096 * 4096
-+const MAX_IMAGE_BYTES = 4 * (2048 * 1536) * 4
- 
- // Only mobile WebViews get that budget. Desktop browsers have no per-process
- // memory ceiling, and a page fitted to a desktop window is several times the
-@@ -425,12 +426,15 @@ const isMobileWebView = () => {
- // budget. Never below 1 (CSS resolution).
- const getRenderDpr = (page, zoom) => {
-     let dpr = devicePixelRatio || 1
--    if (isMobileWebView()) {
--        dpr = Math.min(dpr, MAX_RENDER_DPR)
--        const { width, height } = page.getViewport({ scale: zoom || 1 })
--        const area = width * height * dpr * dpr
--        if (area > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / area)
--    }
-+    const mobile = isMobileWebView()
-+    if (mobile) dpr = Math.min(dpr, MAX_RENDER_DPR)
-+    // A big page zoomed in can ask for a bitmap of tens of megapixels (hundreds
-+    // of MB, seconds to draw). Past the cap the bitmap is stretched instead,
-+    // exactly as pdf.js's own viewer does at 16.7 Mpx.
-+    const cap = mobile ? MAX_CANVAS_PIXELS : MAX_DESKTOP_CANVAS_PIXELS
-+    const { width, height } = page.getViewport({ scale: zoom || 1 })
-+    const area = width * height * dpr * dpr
-+    if (area > cap) dpr *= Math.sqrt(cap / area)
-     return Math.max(1, dpr)
- }
- 
-@@ -587,7 +591,54 @@ const getRenderOperatorList = (page, renderTask) => {
-             if (task.task === renderTask) return operatorList
- }
- 
--const render = async (page, doc, zoom, pageColors) => {
-+// Per document: the page + font scale its text/annotation layers were built for.
-+const layersBuilt = new WeakMap()
-+// Per document: the last page and zoom asked for, and a zoom redraw that is
-+// waiting for the zooming to pause.
-+const lastRequest = new WeakMap()
-+const pendingZoom = new WeakMap()
-+const ZOOM_REDRAW_DELAY = 120
-+
-+// A zoom change (pinch, keyboard step, slider) shows the old bitmap stretched to
-+// the new size straight away and only redraws the sharp one once the zooming
-+// pauses. Redrawing on every step just starts and cancels expensive renders,
-+// and a half-finished one would land at the old size and flash.
-+const render = (page, doc, zoom, pageColors) => {
-+    if (!doc) return
-+    const pending = pendingZoom.get(doc)
-+    if (pending) {
-+        clearTimeout(pending.timer)
-+        pendingZoom.delete(doc)
-+        pending.resolve()
-+    }
-+    const last = lastRequest.get(doc)
-+    lastRequest.set(doc, { page, zoom })
-+    if (!(last && last.page === page && last.zoom !== zoom))
-+        return renderNow(page, doc, zoom, pageColors)
-+
-+    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
-+    const viewport = page.getViewport({ scale: zoom })
-+    const stale = doc.querySelector('#canvas canvas')
-+    if (stale) {
-+        stale.style.width = `${viewport.width}px`
-+        stale.style.height = `${viewport.height}px`
-+    }
-+    // Drop whatever is still drawing for the old zoom, and make sure the redraw
-+    // below isn't skipped as "already rendered".
-+    renderGenerations.set(doc, (renderGenerations.get(doc) || 0) + 1)
-+    activeRenderTasks.get(doc)?.cancel()
-+    activeRenderTasks.delete(doc)
-+    renderedFor.delete(doc)
-+    return new Promise(resolve => {
-+        const timer = setTimeout(() => {
-+            pendingZoom.delete(doc)
-+            renderNow(page, doc, zoom, pageColors).then(resolve, resolve)
-+        }, ZOOM_REDRAW_DELAY)
-+        pendingZoom.set(doc, { timer, resolve })
-+    })
-+}
-+
-+const renderNow = async (page, doc, zoom, pageColors) => {
-     if (!doc) return
- 
-     // Rendering tears the text layer down and builds it again, which detaches
-@@ -640,18 +691,46 @@ const render = async (page, doc, zoom, pageColors) => {
-     const renderViewport = page.getViewport({ scale: renderScale })
-     const displayViewport = page.getViewport({ scale: zoom })
- 
-+    // The sharp bitmap takes a while to draw (much longer on a phone), and the
-+    // old canvas keeps its old CSS size until it is swapped, so the page used to
-+    // shrink back / sit small while the text layer (which scales instantly)
-+    // moved on without it. Stretch the previous bitmap to the new size right
-+    // away: a blurry-but-correct page now, the crisp one as soon as it's ready.
-+    const staleCanvas = doc.querySelector('#canvas canvas')
-+    if (staleCanvas) {
-+        staleCanvas.style.width = `${displayViewport.width}px`
-+        staleCanvas.style.height = `${displayViewport.height}px`
-+    }
-+
-     // the canvas must be in the `PDFDocument`'s `ownerDocument`
-     // (`globalThis.document` by default); that's where the fonts are loaded
-     const canvas = document.createElement('canvas')
--    canvas.height = renderViewport.height
--    canvas.width = renderViewport.width
--    // The CSS box is the un-truncated display size, so the (integer-truncated)
--    // over-sampled bitmap is scaled by the browser to fill the page box exactly.
--    // Pinning the box to the display viewport (rather than letting the truncated
--    // bitmap drive layout) also keeps the left page flush to the spine of a
--    // two-page spread instead of exposing a one-pixel white seam (#4587).
--    canvas.style.width = `${displayViewport.width}px`
--    canvas.style.height = `${displayViewport.height}px`
-+    if (renderDpr === devicePixelRatio) {
-+        // The bitmap is at the screen's own resolution, so make it map onto the
-+        // screen 1:1. A bitmap that is not a whole number of device pixels across
-+        // its box gets resampled by the browser, which softens glyph edges (what
-+        // pdf.js's own viewer avoids by sizing its canvas the same way). Round the
-+        // bitmap UP to whole device pixels and size the CSS box to exactly that
-+        // many. Up, not down: the box stays at least as big as the page box, so
-+        // the left page of a two-page spread still reaches the spine (#4587) and
-+        // the sub-pixel excess is clipped by the page's iframe. The epsilon stops
-+        // floating-point noise (783.0000001) from adding a whole extra pixel.
-+        canvas.width = Math.ceil(renderViewport.width - 1e-3)
-+        canvas.height = Math.ceil(renderViewport.height - 1e-3)
-+        canvas.style.width = `${canvas.width / renderDpr}px`
-+        canvas.style.height = `${canvas.height / renderDpr}px`
-+    } else {
-+        // The bitmap is deliberately coarser than the screen (memory budget, or a
-+        // zoomed-out window), so it is stretched anyway. The CSS box is the
-+        // un-truncated display size, so the (integer-truncated) bitmap is scaled
-+        // by the browser to fill the page box exactly. Pinning the box to the
-+        // display viewport also keeps the left page flush to the spine of a
-+        // two-page spread instead of exposing a one-pixel white seam (#4587).
-+        canvas.height = renderViewport.height
-+        canvas.width = renderViewport.width
-+        canvas.style.width = `${displayViewport.width}px`
-+        canvas.style.height = `${displayViewport.height}px`
-+    }
-     const canvasContext = canvas.getContext('2d')
-     const renderTask = page.render({ canvasContext, viewport: renderViewport })
-     activeRenderTasks.set(doc, renderTask)
-@@ -709,6 +788,17 @@ const render = async (page, doc, zoom, pageColors) => {
-         return rect ? () => renderRegion(page, renderScale, rect) : null
-     }
- 
-+    // The text and annotation layers are positioned in percentages of the page
-+    // and sized from --total-scale-factor, so a zoom change alone doesn't touch
-+    // them. Rebuilding thousands of spans on every zoom step was a large part of
-+    // the delay on big pages (and it detached every Range held into the text).
-+    const built = layersBuilt.get(doc)
-+    if (built?.page === page && built.fontScale === getFontScale(doc)
-+        && doc.querySelector('.textLayer .endOfContent')
-+        // only when the spans are sized by CSS variables (newer pdf.js)
-+        && doc.querySelector('.textLayer span')?.style.getPropertyValue('--font-height')) return
-+    layersBuilt.delete(doc)
-+
-     // Clear text layer before re-rendering to prevent DOM accumulation
-     const container = doc.querySelector('.textLayer')
-     container.replaceChildren()
-@@ -768,6 +858,7 @@ const render = async (page, doc, zoom, pageColors) => {
-     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
-         annotations: await page.getAnnotations(),
-     })
-+    layersBuilt.set(doc, { page, fontScale })
- }
- 
- const renderPage = async (page, getImageBlob) => {
